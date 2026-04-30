@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { AISettings } from "./ai-settings";
+import { buildLeadUserDataBlock } from "./lead-prompt-block";
 
 class OpenAIService {
   private client: OpenAI | null = null;
@@ -94,7 +95,8 @@ class OpenAIService {
     systemPrompt: string,
     userInstructions: string,
     leadData: Record<string, any>,
-    settings: AISettings
+    settings: AISettings,
+    scrapedContent?: string
   ): Promise<string> {
     if (!this.client) {
       throw new Error("Cliente OpenAI não configurado. Configure primeiro com configure(apiKey)");
@@ -102,8 +104,8 @@ class OpenAIService {
 
     await this.waitForRateLimit();
 
-    const leadDataJson = JSON.stringify(leadData, null, 2);
-    const userContent = `${userInstructions}\n\nDados do lead:\n${leadDataJson}`;
+    const dataLine = buildLeadUserDataBlock(leadData, scrapedContent);
+    const userContent = `${userInstructions}\n\n${dataLine}`;
 
     const makeRequest = async () => {
       // Validação de prompts

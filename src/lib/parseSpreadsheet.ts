@@ -5,7 +5,7 @@ const MAX_ROWS = 10000;
 
 export async function parseSpreadsheet(
   file: File
-): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
+): Promise<{ rows: Record<string, unknown>[]; columns: string[]; fileId: string; fileName: string }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     const isCSV = file.name.toLowerCase().endsWith(".csv");
@@ -46,7 +46,10 @@ export async function parseSpreadsheet(
         }
 
         const columns = Object.keys(jsonData[0] || {});
-        resolve({ rows: jsonData, columns });
+        const fileFingerprint = `${file.name}|${file.size}|${file.lastModified}`;
+        createFileId(fileFingerprint).then((fileId) => {
+          resolve({ rows: jsonData, columns, fileId, fileName: file.name });
+        }).catch(reject);
       } catch (err) {
         reject(err instanceof Error ? err : new Error("Erro ao processar o arquivo"));
       }
@@ -64,11 +67,19 @@ export async function parseSpreadsheet(
   });
 }
 
+async function createFileId(input: string): Promise<string> {
+  const encoded = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export function rowsToLeads(
   rows: Record<string, unknown>[],
   selectedColumns: Set<string>
 ): Lead[] {
-  return rows.map((row) => {
+  return rows.map((row, index) => {
     const lead: Lead = {};
     selectedColumns.forEach((col) => {
       const v = row[col];
@@ -76,6 +87,7 @@ export function rowsToLeads(
         lead[col] = String(v).trim();
       }
     });
+    lead._rowId = `r-${String(index + 1).padStart(6, "0")}`;
     return lead;
   });
 }

@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AISettings } from "./ai-settings";
+import { buildLeadUserDataBlock } from "./lead-prompt-block";
 
 const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5";
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
@@ -134,7 +135,8 @@ class ClaudeService {
     systemPrompt: string,
     userInstructions: string,
     leadData: Record<string, any>,
-    settings: AISettings
+    settings: AISettings,
+    scrapedContent?: string
   ): Promise<string> {
     if (!this.client) {
       throw new Error(
@@ -144,8 +146,8 @@ class ClaudeService {
 
     await this.waitForRateLimit();
 
-    const leadDataJson = JSON.stringify(leadData, null, 2);
-    const userContent = `${userInstructions}\n\nDados do lead:\n${leadDataJson}`;
+    const dataLine = buildLeadUserDataBlock(leadData, scrapedContent);
+    const userContent = `${userInstructions}\n\n${dataLine}`;
 
     const model = resolveClaudeModel(settings.claudeModel);
     const makeRequest = async () => {

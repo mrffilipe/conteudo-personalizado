@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { AISettings } from "./ai-settings";
+import { buildLeadUserDataBlock } from "./lead-prompt-block";
 
 class GeminiService {
   private client: GoogleGenAI | null = null;
@@ -107,7 +108,8 @@ class GeminiService {
     systemPrompt: string,
     userInstructions: string,
     leadData: Record<string, any>,
-    settings: AISettings
+    settings: AISettings,
+    scrapedContent?: string
   ): Promise<string> {
     if (!this.client) {
       throw new Error(
@@ -118,8 +120,8 @@ class GeminiService {
     const model = settings.geminiModel || "gemini-2.5-flash";
     await this.waitForRateLimit(model);
 
-    const leadDataJson = JSON.stringify(leadData, null, 2);
-    const userContent = `${userInstructions}\n\nDados do lead:\n${leadDataJson}`;
+    const dataLine = buildLeadUserDataBlock(leadData, scrapedContent);
+    const userContent = `${userInstructions}\n\n${dataLine}`;
 
     const makeRequest = async () => {
       const response = await this.client!.models.generateContent({
