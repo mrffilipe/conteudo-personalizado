@@ -9,6 +9,10 @@ export interface ProcessingResult {
   temperature: number;
   index: number;
   scrapedSummary?: string;
+  emailSentSuccess?: boolean;
+  emailSentAt?: string;
+  emailSentError?: string;
+  emailSentAttempts?: number;
 }
 
 export interface CheckpointData {

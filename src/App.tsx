@@ -3,8 +3,13 @@ import * as XLSX from "xlsx";
 import { DEFAULT_AI_SETTINGS, type AISettings } from "./lib/ai-settings";
 import {
   checkCheckpoint,
+  getEmailDispatchProgress,
+  importEmailCheckpoint,
   processLeads,
   restartCheckpoint,
+  sendManualEmailTest,
+  startBatchEmailDispatch,
+  type EmailDispatchProgress,
   type GenerationProgress,
   type ProcessingResult,
   type ProcessFileMeta,
@@ -110,6 +115,17 @@ export default function App() {
   const [results, setResults] = useState<ProcessingResult[]>([]);
   const [processing, setProcessing] = useState(false);
   const [runStats, setRunStats] = useState<GenerationProgress | null>(null);
+  const [sendgridApiKey, setSendgridApiKey] = useState("");
+  const [batchEmailSubject, setBatchEmailSubject] = useState("");
+  const [batchEmailLimit, setBatchEmailLimit] = useState(0);
+  const [emailStats, setEmailStats] = useState<EmailDispatchProgress | null>(null);
+  const [emailDispatchError, setEmailDispatchError] = useState<string | null>(null);
+  const [manualTo, setManualTo] = useState("");
+  const [manualSubject, setManualSubject] = useState("");
+  const [manualContent, setManualContent] = useState("");
+  const [manualSending, setManualSending] = useState(false);
+  const [manualSendMessage, setManualSendMessage] = useState<string | null>(null);
+  const [batchSending, setBatchSending] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [downloadXlsxUrl, setDownloadXlsxUrl] = useState<string | null>(null);
   const [downloadCsvUrl, setDownloadCsvUrl] = useState<string | null>(null);
@@ -147,6 +163,8 @@ export default function App() {
     setResults([]);
     setResumeInfo(null);
     setResumeChoice(null);
+    setEmailStats(null);
+    setEmailDispatchError(null);
     setDownloadXlsxUrl(null);
     setDownloadCsvUrl(null);
     if (!file) return;
@@ -174,8 +192,49 @@ export default function App() {
     }
   }, []);
 
+  const onEmailFile = useCallback(async (file: File | null) => {
+    setParseError(null);
+    setEmailDispatchError(null);
+    if (!file) return;
+    const ext = file.name.toLowerCase().slice(file.name.lastIndexOf("."));
+    if (![".xlsx", ".xls", ".csv"].includes(ext)) {
+      setParseError("Use .xlsx, .xls ou .csv");
+      return;
+    }
+    setParsing(true);
+    try {
+      const { rows, columns: cols, fileId, fileName } = await parseSpreadsheet(file);
+      setRawRows(rows);
+      setColumns(cols);
+      setSelectedColumns(new Set(cols));
+      const nextMeta = { fileId, fileName, columnsOriginal: cols };
+      setFileMeta(nextMeta);
+
+      const hasContentColumn = cols.some((c) => c.toLowerCase() === "conteudo_gerado");
+      if (hasContentColumn) {
+        const imported = await importEmailCheckpoint(nextMeta, rows);
+        setResumeInfo({ completed: imported.completed, total: imported.total || rows.length });
+      } else {
+        const checkpoint = await checkCheckpoint(fileId);
+        if (checkpoint.found && checkpoint.completed > 0) {
+          setResumeInfo({ completed: checkpoint.completed, total: checkpoint.total || rows.length });
+        } else {
+          setResumeInfo(null);
+        }
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Falha ao ler/importar arquivo para envio";
+      setParseError(message);
+      setEmailDispatchError(message);
+    } finally {
+      setParsing(false);
+    }
+  }, []);
+
   const run = async () => {
     setRunError(null);
+    setEmailStats(null);
+    setEmailDispatchError(null);
     if (!knowledgeBase.trim() || !instruction.trim()) {
       setRunError("Preencha a base de conhecimento e a instrução.");
       return;
@@ -186,6 +245,10 @@ export default function App() {
     }
     if (!fileMeta || leadsFromSelection.length === 0) {
       setRunError("Carregue uma planilha e selecione ao menos uma coluna com dados.");
+      return;
+    }
+    if (sendgridApiKey.trim() && !batchEmailSubject.trim()) {
+      setRunError("Informe o assunto do envio em lote para disparar emails via XLSX.");
       return;
     }
     if (resumeInfo && resumeChoice === null) {
@@ -223,16 +286,120 @@ export default function App() {
         fileMeta,
         (stats) => setRunStats(stats),
         settings,
-        { enrichFromWebsite, resumeExisting: resumeChoice !== false }
+        { enrichFromWebsite, resumeExisting: resumeChoice !== false },
+        sendgridApiKey,
+        batchEmailSubject,
+        batchEmailLimit
       );
       setResults(out.results);
       setDownloadXlsxUrl(out.downloadXlsxUrl);
       setDownloadCsvUrl(out.downloadCsvUrl);
+      setEmailDispatchError(out.emailDispatchError);
+      if (out.emailDispatchId) {
+        const poll = async () => {
+          const stats = await getEmailDispatchProgress(out.emailDispatchId as string);
+          if (!stats) {
+            setEmailDispatchError("Não foi possível consultar o status do envio.");
+            return true;
+          }
+          setEmailStats(stats);
+          return stats.status !== "running";
+        };
+        let done = await poll();
+        while (!done) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          done = await poll();
+        }
+      }
     } catch (e) {
       setRunError(e instanceof Error ? e.message : "Erro ao processar");
     } finally {
       setProcessing(false);
       setRunStats(null);
+    }
+  };
+
+  const sendManualTest = async () => {
+    setManualSendMessage(null);
+    setEmailDispatchError(null);
+    if (!sendgridApiKey.trim()) {
+      setManualSendMessage("Informe a API key do SendGrid para envio manual.");
+      return;
+    }
+    if (!manualTo.trim() || !manualSubject.trim() || !manualContent.trim()) {
+      setManualSendMessage("Preencha destinatario, assunto e conteudo para envio manual.");
+      return;
+    }
+    setManualSending(true);
+    try {
+      await sendManualEmailTest({
+        sendgridApiKey,
+        to: manualTo,
+        subject: manualSubject,
+        content: manualContent,
+      });
+      setManualSendMessage("Email de teste enviado com sucesso.");
+    } catch (error) {
+      setManualSendMessage(error instanceof Error ? error.message : "Falha ao enviar email manual.");
+    } finally {
+      setManualSending(false);
+    }
+  };
+
+  const startBatchDispatch = async () => {
+    setEmailDispatchError(null);
+    setEmailStats(null);
+    if (!fileMeta) {
+      setEmailDispatchError("Selecione um arquivo antes de disparar o envio em lote.");
+      return;
+    }
+    if (!sendgridApiKey.trim()) {
+      setEmailDispatchError("Informe a API key do SendGrid para envio em lote.");
+      return;
+    }
+    if (!batchEmailSubject.trim()) {
+      setEmailDispatchError("Informe o assunto para envio em lote.");
+      return;
+    }
+    setBatchSending(true);
+    try {
+      const out = await startBatchEmailDispatch({
+        fileMeta,
+        sendgridApiKey,
+        emailSubject: batchEmailSubject,
+        emailLimit: batchEmailLimit,
+      });
+      if (out.downloadXlsxUrl) setDownloadXlsxUrl(out.downloadXlsxUrl);
+      if (out.emailDispatchError) {
+        setEmailDispatchError(
+          out.emailDispatchError === "checkpoint nao encontrado"
+            ? "Checkpoint nao encontrado para este arquivo. Gere conteúdo para este arquivo primeiro, ou use o mesmo arquivo de saída da geração desta aplicação."
+            : out.emailDispatchError
+        );
+        return;
+      }
+      if (!out.emailDispatchId) {
+        setEmailDispatchError("Não foi possível iniciar o disparo em lote.");
+        return;
+      }
+      const poll = async () => {
+        const stats = await getEmailDispatchProgress(out.emailDispatchId as string);
+        if (!stats) {
+          setEmailDispatchError("Não foi possível consultar o status do envio.");
+          return true;
+        }
+        setEmailStats(stats);
+        return stats.status !== "running";
+      };
+      let done = await poll();
+      while (!done) {
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        done = await poll();
+      }
+    } catch (error) {
+      setEmailDispatchError(error instanceof Error ? error.message : "Falha ao disparar envio em lote.");
+    } finally {
+      setBatchSending(false);
     }
   };
 
@@ -336,7 +503,98 @@ export default function App() {
           )}
         </section>
 
+        <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="mb-3 text-sm font-semibold text-slate-800">4. Enviador de email</h2>
+          <p className="mb-2 text-xs text-slate-500">
+            O disparo usa o arquivo `.xlsx` de saída e envia um email por linha para a coluna de email, com o texto de `conteudo_gerado`.
+          </p>
+          <input
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            className="mb-3 text-sm"
+            disabled={parsing || processing || manualSending || batchSending}
+            onChange={(e) => onEmailFile(e.target.files?.[0] ?? null)}
+          />
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder="Cole aqui sua API key do SendGrid (SG....)"
+            className="w-full rounded-lg border border-slate-300 p-2 font-mono text-sm"
+            value={sendgridApiKey}
+            onChange={(e) => setSendgridApiKey(e.target.value)}
+            disabled={processing}
+          />
+          <input
+            type="text"
+            autoComplete="off"
+            placeholder="Assunto obrigatório para envio em lote (.xlsx)"
+            className="mt-3 w-full rounded-lg border border-slate-300 p-2 text-sm"
+            value={batchEmailSubject}
+            onChange={(e) => setBatchEmailSubject(e.target.value)}
+            disabled={processing}
+          />
+          <input
+            type="number"
+            min={0}
+            step={1}
+            placeholder="Limite de envios por disparo (0 = enviar todos os pendentes)"
+            className="mt-3 w-full rounded-lg border border-slate-300 p-2 text-sm"
+            value={batchEmailLimit}
+            onChange={(e) => setBatchEmailLimit(Math.max(0, parseInt(e.target.value, 10) || 0))}
+            disabled={processing}
+          />
+          <div className="mt-4 grid gap-3">
+            <button
+              type="button"
+              onClick={startBatchDispatch}
+              disabled={processing || manualSending || batchSending || !fileMeta}
+              className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {batchSending ? "Disparando lote..." : "Disparar emails do arquivo selecionado"}
+            </button>
+            <p className="text-xs text-slate-500">Teste manual de envio (independente do XLSX):</p>
+            <input
+              type="email"
+              autoComplete="off"
+              placeholder="Email do destinatario"
+              className="w-full rounded-lg border border-slate-300 p-2 text-sm"
+              value={manualTo}
+              onChange={(e) => setManualTo(e.target.value)}
+              disabled={processing || manualSending}
+            />
+            <input
+              type="text"
+              autoComplete="off"
+              placeholder="Assunto do email"
+              className="w-full rounded-lg border border-slate-300 p-2 text-sm"
+              value={manualSubject}
+              onChange={(e) => setManualSubject(e.target.value)}
+              disabled={processing || manualSending}
+            />
+            <textarea
+              className="w-full rounded-lg border border-slate-300 p-2 text-sm"
+              rows={5}
+              placeholder="Cole aqui o conteudo manual do email"
+              value={manualContent}
+              onChange={(e) => setManualContent(e.target.value)}
+              disabled={processing || manualSending}
+            />
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={sendManualTest}
+                disabled={processing || manualSending}
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              >
+                {manualSending ? "Enviando teste..." : "Enviar teste manual"}
+              </button>
+              {manualSendMessage && <span className="text-sm text-slate-700">{manualSendMessage}</span>}
+            </div>
+          </div>
+        </section>
+
         {runError && <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{runError}</p>}
+        {emailDispatchError && <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{emailDispatchError}</p>}
 
         <button type="button" onClick={run} disabled={processing || leadsFromSelection.length === 0} className="rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">
           {processing ? "Gerando..." : "Gerar conteúdo"}
@@ -401,6 +659,62 @@ export default function App() {
                 <dd className="text-slate-700">
                   {runStats.processedThisRun} linha(s) processada(s) desde o início do clique em Gerar
                   {runStats.processedThisRun === 0 && " — a estimativa aparece após a primeira leva."}
+                </dd>
+              </div>
+            </dl>
+          </section>
+        )}
+
+        {emailStats && (
+          <section className="rounded-xl border border-slate-200 bg-slate-50/80 p-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-slate-800">Estatísticas de envio (ao vivo)</h3>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Disparo: {emailStats.dispatchId} · status: {emailStats.status}
+            </p>
+            <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Progresso</dt>
+                <dd className="font-mono text-slate-900">
+                  {emailStats.done} / {emailStats.total}
+                  <span className="text-slate-500"> ({emailStats.remaining} restantes)</span>
+                </dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Tempo decorrido</dt>
+                <dd className="font-mono text-slate-900">{formatDurationMs(emailStats.elapsedMs)}</dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Estimativa para concluir</dt>
+                <dd className="font-mono text-slate-900">{formatEta(emailStats.etaMs)}</dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Média / email</dt>
+                <dd className="font-mono text-slate-900">
+                  {emailStats.avgMsPerEmail != null ? formatDurationMs(emailStats.avgMsPerEmail) : "—"}
+                </dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Ritmo</dt>
+                <dd className="font-mono text-slate-900">
+                  {emailStats.emailsPerMinute != null ? `${emailStats.emailsPerMinute.toFixed(1)} emails/min` : "—"}
+                </dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Taxa de sucesso</dt>
+                <dd className="font-mono text-slate-900">{emailStats.successRate.toFixed(1)}%</dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Sucesso</dt>
+                <dd className="font-mono text-green-700">{emailStats.sent}</dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                <dt className="text-xs font-medium text-slate-500">Falhas</dt>
+                <dd className="font-mono text-red-700">{emailStats.failed}</dd>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 sm:col-span-2 lg:col-span-3">
+                <dt className="text-xs font-medium text-slate-500">Amostra de erros</dt>
+                <dd className="text-slate-700">
+                  {emailStats.errorsSample.length > 0 ? emailStats.errorsSample.join(" | ") : "Sem erros até o momento."}
                 </dd>
               </div>
             </dl>

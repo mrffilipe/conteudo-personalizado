@@ -21,6 +21,10 @@ function toRows(checkpoint: CheckpointData): Record<string, string>[] {
     row["_modelo"] = result.aiModel;
     row["_status"] = result.success ? "ok" : "erro";
     row["_site_resumo"] = result.scrapedSummary ?? "";
+    row["_email_enviado"] = result.emailSentSuccess ? "sim" : "nao";
+    row["_email_enviado_em"] = result.emailSentAt ?? "";
+    row["_email_erro_envio"] = result.emailSentError ?? "";
+    row["_email_tentativas"] = String(result.emailSentAttempts ?? 0);
     return row;
   });
 }

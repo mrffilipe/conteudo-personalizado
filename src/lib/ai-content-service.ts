@@ -71,6 +71,24 @@ export interface GenerationProgress {
 
 export type ProgressCallback = (stats: GenerationProgress) => void;
 
+export interface EmailDispatchProgress {
+  dispatchId: string;
+  status: "running" | "completed" | "failed";
+  total: number;
+  sent: number;
+  failed: number;
+  done: number;
+  remaining: number;
+  successRate: number;
+  elapsedMs: number;
+  etaMs: number | null;
+  avgMsPerEmail: number | null;
+  emailsPerMinute: number | null;
+  startedAt: string;
+  finishedAt?: string;
+  errorsSample: string[];
+}
+
 function getModelName(settings: AISettings): string {
   if (settings.aiProvider === "openai") return settings.model;
   if (settings.aiProvider === "claude") return settings.claudeModel;
@@ -142,15 +160,75 @@ async function saveCheckpoint(fileId: string, results: ProcessingResult[]): Prom
   });
 }
 
-async function finishCheckpoint(fileMeta: ProcessFileMeta, format: "xlsx" | "csv"): Promise<string | null> {
+async function finishCheckpoint(
+  fileMeta: ProcessFileMeta,
+  format: "xlsx" | "csv",
+  sendgridApiKey?: string,
+  emailSubject?: string,
+  emailLimit?: number
+): Promise<{ downloadUrl: string | null; emailDispatchId: string | null; emailDispatchError: string | null }> {
   const response = await fetch("/api/checkpoint/finish", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ fileId: fileMeta.fileId, format, fileName: fileMeta.fileName }),
+    body: JSON.stringify({ fileId: fileMeta.fileId, format, fileName: fileMeta.fileName, sendgridApiKey, emailSubject, emailLimit }),
   });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    return {
+      downloadUrl: null,
+      emailDispatchId: null,
+      emailDispatchError: err.error ?? `Falha ao finalizar checkpoint (HTTP ${response.status})`,
+    };
+  }
+  const data = (await response.json()) as { downloadUrl?: string; emailDispatchId?: string | null; emailDispatchError?: string | null };
+  return {
+    downloadUrl: data.downloadUrl ?? null,
+    emailDispatchId: data.emailDispatchId ?? null,
+    emailDispatchError: data.emailDispatchError ?? null,
+  };
+}
+
+export async function getEmailDispatchProgress(dispatchId: string): Promise<EmailDispatchProgress | null> {
+  const response = await fetch(`/api/email-dispatch/${encodeURIComponent(dispatchId)}`);
   if (!response.ok) return null;
-  const data = (await response.json()) as { downloadUrl?: string };
-  return data.downloadUrl ?? null;
+  return (await response.json()) as EmailDispatchProgress;
+}
+
+export async function startBatchEmailDispatch(params: {
+  fileMeta: ProcessFileMeta;
+  sendgridApiKey: string;
+  emailSubject: string;
+  emailLimit: number;
+}): Promise<{ emailDispatchId: string | null; emailDispatchError: string | null; downloadXlsxUrl: string | null }> {
+  const finish = await finishCheckpoint(
+    params.fileMeta,
+    "xlsx",
+    params.sendgridApiKey,
+    params.emailSubject,
+    params.emailLimit
+  );
+  return {
+    emailDispatchId: finish.emailDispatchId,
+    emailDispatchError: finish.emailDispatchError,
+    downloadXlsxUrl: finish.downloadUrl,
+  };
+}
+
+export async function sendManualEmailTest(payload: {
+  sendgridApiKey: string;
+  to: string;
+  subject: string;
+  content: string;
+}): Promise<void> {
+  const response = await fetch("/api/email-send-test", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const data = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error ?? `Falha no envio manual: HTTP ${response.status}`);
+  }
 }
 
 export async function checkCheckpoint(fileId: string): Promise<{ found: boolean; completed: number; total: number }> {
@@ -162,6 +240,22 @@ export async function checkCheckpoint(fileId: string): Promise<{ found: boolean;
   } catch {
     return { found: false, completed: 0, total: 0 };
   }
+}
+
+export async function importEmailCheckpoint(
+  fileMeta: ProcessFileMeta,
+  rows: Record<string, unknown>[]
+): Promise<{ found: boolean; completed: number; total: number }> {
+  const response = await fetch("/api/checkpoint/import-email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ fileId: fileMeta.fileId, fileName: fileMeta.fileName, rows }),
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error ?? `Falha ao importar checkpoint de email (HTTP ${response.status})`);
+  }
+  return (await response.json()) as { found: boolean; completed: number; total: number };
 }
 
 export async function restartCheckpoint(fileId: string): Promise<void> {
@@ -177,9 +271,20 @@ export async function processLeads(
   fileMeta: ProcessFileMeta,
   onProgress: ProgressCallback,
   settings: AISettings,
-  options?: { enrichFromWebsite?: boolean; resumeExisting?: boolean }
-): Promise<{ results: ProcessingResult[]; downloadXlsxUrl: string | null; downloadCsvUrl: string | null }> {
-  if (!leads.length) return { results: [], downloadXlsxUrl: null, downloadCsvUrl: null };
+  options?: { enrichFromWebsite?: boolean; resumeExisting?: boolean },
+  sendgridApiKey?: string,
+  emailSubject?: string,
+  emailLimit?: number
+): Promise<{
+  results: ProcessingResult[];
+  downloadXlsxUrl: string | null;
+  downloadCsvUrl: string | null;
+  emailDispatchId: string | null;
+  emailDispatchError: string | null;
+}> {
+  if (!leads.length) {
+    return { results: [], downloadXlsxUrl: null, downloadCsvUrl: null, emailDispatchId: null, emailDispatchError: null };
+  }
 
   const checkpoint = await startCheckpoint(fileMeta, leads.length);
   const completedRowIds = new Set(options?.resumeExisting ? checkpoint.completedRowIds : []);
@@ -295,8 +400,14 @@ export async function processLeads(
     }
   }
 
-  const downloadXlsxUrl = await finishCheckpoint(fileMeta, "xlsx");
-  const downloadCsvUrl = await finishCheckpoint(fileMeta, "csv");
+  const xlsxFinish = await finishCheckpoint(fileMeta, "xlsx", sendgridApiKey, emailSubject, emailLimit);
+  const csvFinish = await finishCheckpoint(fileMeta, "csv");
   allResults.sort((a, b) => a.index - b.index);
-  return { results: allResults, downloadXlsxUrl, downloadCsvUrl };
+  return {
+    results: allResults,
+    downloadXlsxUrl: xlsxFinish.downloadUrl,
+    downloadCsvUrl: csvFinish.downloadUrl,
+    emailDispatchId: xlsxFinish.emailDispatchId,
+    emailDispatchError: xlsxFinish.emailDispatchError,
+  };
 }
